@@ -1,22 +1,41 @@
-import io, zipfile, time
+import io
+import os
+import time
+import uuid
+import hmac
 from typing import List, Tuple
-from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.responses import JSONResponse, StreamingResponse
+
+import cv2
+import numpy as np
+from fastapi import FastAPI, File, UploadFile, HTTPException, Query, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, Response
 
-import cv2, numpy as np
+API_TOKEN = os.getenv("API_TOKEN", "")  # set this in Coolify
 
-app = FastAPI(title="Doc Cropper API", version="1.0.0")
+app = FastAPI(title="Doc Cropper API", version="1.2.0")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten later
+    allow_origins=["*"],            # tighten in prod
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# ---------- auth ----------
+def bearer_auth(request: Request):
+    if not API_TOKEN:
+        raise HTTPException(500, "Server not configured with API_TOKEN")
+    auth = request.headers.get("Authorization") or ""
+    if not auth.startswith("Bearer "):
+        raise HTTPException(401, "Missing bearer token")
+    token = auth[7:].strip()
+    if not hmac.compare_digest(token, API_TOKEN):
+        raise HTTPException(401, "Invalid token")
+
+# ---------- helpers ----------
 def _order_quad(pts: np.ndarray) -> np.ndarray:
-    """Order quad points: top-left, top-right, bottom-right, bottom-left"""
     rect = np.zeros((4, 2), dtype="float32")
     s = pts.sum(axis=1)
     rect[0] = pts[np.argmin(s)]
@@ -26,7 +45,7 @@ def _order_quad(pts: np.ndarray) -> np.ndarray:
     rect[3] = pts[np.argmax(diff)]
     return rect
 
-def _warp(image: np.ndarray, quad: np.ndarray) -> np.ndarray:
+def _warp_perspective(image: np.ndarray, quad: np.ndarray) -> np.ndarray:
     rect = _order_quad(quad.reshape(4, 2))
     (tl, tr, br, bl) = rect
     widthA = np.linalg.norm(br - bl)
@@ -35,71 +54,132 @@ def _warp(image: np.ndarray, quad: np.ndarray) -> np.ndarray:
     heightB = np.linalg.norm(tl - bl)
     maxWidth = int(max(widthA, widthB))
     maxHeight = int(max(heightA, heightB))
-    dst = np.array([
-        [0, 0],
-        [maxWidth - 1, 0],
-        [maxWidth - 1, maxHeight - 1],
-        [0, maxHeight - 1]], dtype="float32")
+    maxWidth = max(maxWidth, 200)
+    maxHeight = max(maxHeight, 200)
+    dst = np.array(
+        [[0, 0], [maxWidth - 1, 0], [maxWidth - 1, maxHeight - 1], [0, maxHeight - 1]],
+        dtype="float32",
+    )
     M = cv2.getPerspectiveTransform(rect, dst)
-    return cv2.warpPerspective(image, M, (maxWidth, maxHeight))
+    return cv2.warpPerspective(image, M, (maxWidth, maxHeight), flags=cv2.INTER_CUBIC)
 
-def detect_documents(bgr: np.ndarray, min_area: int = 20000) -> List[np.ndarray]:
-    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (5, 5), 0)
-    edged = cv2.Canny(gray, 75, 200)
-    cnts, _ = cv2.findContours(edged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    quads = []
-    for c in cnts:
+def _score_upright(img_bgr: np.ndarray) -> float:
+    g = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    g = cv2.GaussianBlur(g, (3, 3), 0)
+    edges = cv2.Canny(g, 80, 160)
+    k = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, k, iterations=1)
+    row_var = float(np.var(edges.sum(axis=1)) / (len(edges) + 1e-6))
+    col_var = float(np.var(edges.sum(axis=0)) / (len(edges[0]) + 1e-6))
+    return row_var - 0.6 * col_var
+
+def auto_upright(img_bgr: np.ndarray) -> np.ndarray:
+    candidates = [
+        img_bgr,
+        cv2.rotate(img_bgr, cv2.ROTATE_90_CLOCKWISE),
+        cv2.rotate(img_bgr, cv2.ROTATE_180),
+        cv2.rotate(img_bgr, cv2.ROTATE_90_COUNTERCLOCKWISE),
+    ]
+    scores = [_score_upright(c) for c in candidates]
+    return candidates[int(np.argmax(scores))]
+
+def _find_candidate_quads(img_bgr: np.ndarray) -> List[np.ndarray]:
+    h, w = img_bgr.shape[:2]
+    img_area = h * w
+
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    thr = cv2.adaptiveThreshold(
+        blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 21, 7
+    )
+    thr = cv2.morphologyEx(thr, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5)), 1)
+    c1, _ = cv2.findContours(thr, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    edges = cv2.Canny(blur, 60, 150)
+    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)), 1)
+    c2, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    contours = c1 + c2
+    quads, seen = [], []
+
+    for c in contours:
         area = cv2.contourArea(c)
-        if area < min_area:
+        if area < 0.02 * img_area or area > 0.9 * img_area:
             continue
         peri = cv2.arcLength(c, True)
         approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-        if len(approx) == 4:
-            quads.append(approx)
-    # Largest first to avoid tiny noise
+        quad = approx if len(approx) == 4 else cv2.boxPoints(cv2.minAreaRect(c)).astype("int").reshape(-1, 1, 2)
+
+        M = cv2.moments(quad)
+        if M["m00"] == 0:
+            continue
+        cx, cy = int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"])
+        if any((abs(cx - x) < 30 and abs(cy - y) < 30) for (x, y) in seen):
+            continue
+        seen.append((cx, cy))
+        quads.append(quad)
+
     quads.sort(key=lambda q: cv2.contourArea(q), reverse=True)
     return quads
 
+def process_image_to_crops(bgr: np.ndarray) -> List[Tuple[str, bytes]]:
+    quads = _find_candidate_quads(bgr)
+    crops: List[Tuple[str, bytes]] = []
+    for idx, q in enumerate(quads, start=1):
+        warped = _warp_perspective(bgr, q)
+        upright = auto_upright(warped)
+        ok, buf = cv2.imencode(".jpg", upright, [cv2.IMWRITE_JPEG_QUALITY, 92])
+        if ok:
+            crops.append((f"document_{idx}.jpg", buf.tobytes()))
+    return crops
+
+def _multipart_mixed(files: List[Tuple[str, bytes]]) -> Response:
+    boundary = f"BOUNDARY-{uuid.uuid4().hex}"
+    bio = io.BytesIO()
+    for fname, data in files:
+        bio.write(f"--{boundary}\r\n".encode())
+        bio.write(
+            (
+                "Content-Type: image/jpeg\r\n"
+                f'Content-Disposition: attachment; filename="{fname}"\r\n'
+                "Content-Transfer-Encoding: binary\r\n\r\n"
+            ).encode()
+        )
+        bio.write(data)
+        bio.write(b"\r\n")
+    bio.write(f"--{boundary}--\r\n".encode())
+    bio.seek(0)
+    return Response(content=bio.read(), media_type=f"multipart/mixed; boundary={boundary}")
+
+# ---------- endpoints ----------
 @app.get("/health")
 def health():
     return {"status": "ok", "time": int(time.time())}
 
 @app.post("/process")
-async def process(file: UploadFile = File(...), return_zip: bool = True):
-    # safety limits
-    if file.size and file.size > 15 * 1024 * 1024:
-        raise HTTPException(400, "File too large (max 15MB).")
+async def process(
+    file: UploadFile = File(...),
+    format: str = Query("json", pattern="^(json|multipart)$"),
+    _auth: None = Depends(bearer_auth),
+):
+    if file.size and file.size > 20 * 1024 * 1024:
+        raise HTTPException(400, "File too large (max 20MB).")
 
-    content = await file.read()
-    image_array = np.frombuffer(content, dtype=np.uint8)
-    bgr = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
+    buf = await file.read()
+    arr = np.frombuffer(buf, np.uint8)
+    bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if bgr is None:
         raise HTTPException(400, "Invalid image file.")
 
-    quads = detect_documents(bgr)
-
-    crops = []
-    for i, q in enumerate(quads, start=1):
-        warp = _warp(bgr, q)
-        ok, buf = cv2.imencode(".jpg", warp, [cv2.IMWRITE_JPEG_QUALITY, 92])
-        if not ok:
-            continue
-        crops.append((f"document_{i}.jpg", buf.tobytes()))
-
-    if not crops:
+    files = process_image_to_crops(bgr)
+    if not files:
         return JSONResponse({"documents_found": 0, "files": []})
 
-    if return_zip:
-        mem = io.BytesIO()
-        with zipfile.ZipFile(mem, "w", zipfile.ZIP_DEFLATED) as zf:
-            for name, data in crops:
-                zf.writestr(name, data)
-        mem.seek(0)
-        return StreamingResponse(mem, media_type="application/zip",
-                                 headers={"Content-Disposition": 'attachment; filename="documents.zip"'})
+    if format == "multipart":
+        return _multipart_mixed(files)
 
-    # else return JSON with base64 inline (not recommended for large files)
+    # default: JSON with base64
     import base64
-    files64 = [{"name": n, "b64": base64.b64encode(d).decode()} for n, d in crops]
-    return {"documents_found": len(crops), "files": files64}
+    out = [{"name": n, "b64": base64.b64encode(d).decode("utf-8")} for n, d in files]
+    return {"documents_found": len(files), "files": out}
