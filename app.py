@@ -7,34 +7,49 @@ from typing import List, Tuple
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, File, UploadFile, HTTPException, Query, Request, Depends
+from fastapi import (
+    FastAPI, File, UploadFile, HTTPException, Query,
+    Depends, Security
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
-API_TOKEN = os.getenv("API_TOKEN", "")  # set this in Coolify
+# ──────────────────────────────────────────────────────────────────────────────
+# Config
+# ──────────────────────────────────────────────────────────────────────────────
+API_TOKEN = os.getenv("API_TOKEN", "")  # set in Coolify env vars
 
-app = FastAPI(title="Doc Cropper API", version="1.2.0")
+app = FastAPI(title="Doc Cropper API", version="1.2.1")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],            # tighten in prod
+    allow_origins=["*"],  # tighten in prod
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ---------- auth ----------
-def bearer_auth(request: Request):
-    if not API_TOKEN:
-        raise HTTPException(500, "Server not configured with API_TOKEN")
-    auth = request.headers.get("Authorization") or ""
-    if not auth.startswith("Bearer "):
-        raise HTTPException(401, "Missing bearer token")
-    token = auth[7:].strip()
-    if not hmac.compare_digest(token, API_TOKEN):
-        raise HTTPException(401, "Invalid token")
+# Swagger security scheme → shows the "Authorize" button
+bearer_scheme = HTTPBearer(auto_error=False)
 
-# ---------- helpers ----------
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Auth
+# ──────────────────────────────────────────────────────────────────────────────
+def bearer_auth(credentials: HTTPAuthorizationCredentials = Security(bearer_scheme)):
+    if not API_TOKEN:
+        raise HTTPException(status_code=500, detail="Server not configured with API_TOKEN")
+    if credentials is None or credentials.scheme.lower() != "bearer":
+        raise HTTPException(status_code=401, detail="Missing bearer token")
+    token = credentials.credentials.strip()
+    if not hmac.compare_digest(token, API_TOKEN):
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# OpenCV helpers
+# ──────────────────────────────────────────────────────────────────────────────
 def _order_quad(pts: np.ndarray) -> np.ndarray:
     rect = np.zeros((4, 2), dtype="float32")
     s = pts.sum(axis=1)
@@ -52,14 +67,9 @@ def _warp_perspective(image: np.ndarray, quad: np.ndarray) -> np.ndarray:
     widthB = np.linalg.norm(tr - tl)
     heightA = np.linalg.norm(tr - br)
     heightB = np.linalg.norm(tl - bl)
-    maxWidth = int(max(widthA, widthB))
-    maxHeight = int(max(heightA, heightB))
-    maxWidth = max(maxWidth, 200)
-    maxHeight = max(maxHeight, 200)
-    dst = np.array(
-        [[0, 0], [maxWidth - 1, 0], [maxWidth - 1, maxHeight - 1], [0, maxHeight - 1]],
-        dtype="float32",
-    )
+    maxWidth = max(int(max(widthA, widthB)), 200)
+    maxHeight = max(int(max(heightA, heightB)), 200)
+    dst = np.array([[0, 0], [maxWidth - 1, 0], [maxWidth - 1, maxHeight - 1], [0, maxHeight - 1]], dtype="float32")
     M = cv2.getPerspectiveTransform(rect, dst)
     return cv2.warpPerspective(image, M, (maxWidth, maxHeight), flags=cv2.INTER_CUBIC)
 
@@ -69,8 +79,8 @@ def _score_upright(img_bgr: np.ndarray) -> float:
     edges = cv2.Canny(g, 80, 160)
     k = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
     edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, k, iterations=1)
-    row_var = float(np.var(edges.sum(axis=1)) / (len(edges) + 1e-6))
-    col_var = float(np.var(edges.sum(axis=0)) / (len(edges[0]) + 1e-6))
+    row_var = float(np.var(edges.sum(axis=1)) / (edges.shape[0] + 1e-6))
+    col_var = float(np.var(edges.sum(axis=0)) / (edges.shape[1] + 1e-6))
     return row_var - 0.6 * col_var
 
 def auto_upright(img_bgr: np.ndarray) -> np.ndarray:
@@ -90,12 +100,14 @@ def _find_candidate_quads(img_bgr: np.ndarray) -> List[np.ndarray]:
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
 
+    # Adaptive threshold path (robust to uneven lighting)
     thr = cv2.adaptiveThreshold(
         blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 21, 7
     )
     thr = cv2.morphologyEx(thr, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5)), 1)
     c1, _ = cv2.findContours(thr, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
+    # Canny fallback
     edges = cv2.Canny(blur, 60, 150)
     edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)), 1)
     c2, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -125,14 +137,14 @@ def _find_candidate_quads(img_bgr: np.ndarray) -> List[np.ndarray]:
 
 def process_image_to_crops(bgr: np.ndarray) -> List[Tuple[str, bytes]]:
     quads = _find_candidate_quads(bgr)
-    crops: List[Tuple[str, bytes]] = []
-    for idx, q in enumerate(quads, start=1):
+    out: List[Tuple[str, bytes]] = []
+    for i, q in enumerate(quads, start=1):
         warped = _warp_perspective(bgr, q)
         upright = auto_upright(warped)
         ok, buf = cv2.imencode(".jpg", upright, [cv2.IMWRITE_JPEG_QUALITY, 92])
         if ok:
-            crops.append((f"document_{idx}.jpg", buf.tobytes()))
-    return crops
+            out.append((f"document_{i}.jpg", buf.tobytes()))
+    return out
 
 def _multipart_mixed(files: List[Tuple[str, bytes]]) -> Response:
     boundary = f"BOUNDARY-{uuid.uuid4().hex}"
@@ -152,7 +164,10 @@ def _multipart_mixed(files: List[Tuple[str, bytes]]) -> Response:
     bio.seek(0)
     return Response(content=bio.read(), media_type=f"multipart/mixed; boundary={boundary}")
 
-# ---------- endpoints ----------
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Endpoints
+# ──────────────────────────────────────────────────────────────────────────────
 @app.get("/health")
 def health():
     return {"status": "ok", "time": int(time.time())}
@@ -161,7 +176,7 @@ def health():
 async def process(
     file: UploadFile = File(...),
     format: str = Query("json", pattern="^(json|multipart)$"),
-    _auth: None = Depends(bearer_auth),
+    _auth: None = Depends(bearer_auth),  # protect this route
 ):
     if file.size and file.size > 20 * 1024 * 1024:
         raise HTTPException(400, "File too large (max 20MB).")
@@ -179,7 +194,7 @@ async def process(
     if format == "multipart":
         return _multipart_mixed(files)
 
-    # default: JSON with base64
+    # default: JSON (base64)
     import base64
-    out = [{"name": n, "b64": base64.b64encode(d).decode("utf-8")} for n, d in files]
-    return {"documents_found": len(files), "files": out}
+    payload = [{"name": n, "b64": base64.b64encode(d).decode("utf-8")} for n, d in files]
+    return {"documents_found": len(files), "files": payload}
