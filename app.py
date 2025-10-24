@@ -3,7 +3,8 @@ import os
 import time
 import uuid
 import hmac
-from typing import List, Tuple
+import zipfile
+from typing import List, Tuple, Literal
 
 import cv2
 import numpy as np
@@ -12,7 +13,7 @@ from fastapi import (
     Depends, Security
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -20,7 +21,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 # ──────────────────────────────────────────────────────────────────────────────
 API_TOKEN = os.getenv("API_TOKEN", "")  # set in Coolify env vars
 
-app = FastAPI(title="Doc Cropper API", version="1.2.1")
+app = FastAPI(title="Doc Cropper API", version="1.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -164,6 +165,15 @@ def _multipart_mixed(files: List[Tuple[str, bytes]]) -> Response:
     bio.seek(0)
     return Response(content=bio.read(), media_type=f"multipart/mixed; boundary={boundary}")
 
+def _zip_response(files: List[Tuple[str, bytes]], zip_name: str) -> StreamingResponse:
+    mem = io.BytesIO()
+    with zipfile.ZipFile(mem, "w", zipfile.ZIP_DEFLATED) as zf:
+        for fname, data in files:
+            zf.writestr(fname, data)
+    mem.seek(0)
+    headers = {"Content-Disposition": f'attachment; filename="{zip_name}"'}
+    return StreamingResponse(mem, media_type="application/zip", headers=headers)
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Endpoints
@@ -175,7 +185,8 @@ def health():
 @app.post("/process")
 async def process(
     file: UploadFile = File(...),
-    format: str = Query("json", pattern="^(json|multipart)$"),
+    output: Literal["json", "multipart", "zip"] = Query("json", description="Response format"),
+    zip_name: str = Query("documents.zip", description="Name of the zip (when output=zip)"),
     _auth: None = Depends(bearer_auth),  # protect this route
 ):
     if file.size and file.size > 20 * 1024 * 1024:
@@ -191,8 +202,10 @@ async def process(
     if not files:
         return JSONResponse({"documents_found": 0, "files": []})
 
-    if format == "multipart":
+    if output == "multipart":
         return _multipart_mixed(files)
+    if output == "zip":
+        return _zip_response(files, zip_name)
 
     # default: JSON (base64)
     import base64
