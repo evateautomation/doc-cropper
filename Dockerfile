@@ -13,7 +13,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app.py .
 
 ENV HOST=0.0.0.0 PORT=8080
-# Set a default (non-secret) token placeholder; override in Coolify
 ENV API_TOKEN=CHANGE_ME
 
 EXPOSE 8080
