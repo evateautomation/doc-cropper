@@ -127,68 +127,53 @@ def _find_candidate_quads(img_bgr: np.ndarray) -> List[np.ndarray]:
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
 
-    # 1) Adaptive threshold + open to separate touching cards
+    # Adaptive thresholding + morphological cleanup
     thr = cv2.adaptiveThreshold(
-        blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 21, 7
+        blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 25, 9
     )
-    k5 = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-    thr = cv2.morphologyEx(thr, cv2.MORPH_OPEN, k5, iterations=1)
-    thr = cv2.morphologyEx(thr, cv2.MORPH_CLOSE, k5, iterations=1)
-    c1, _ = cv2.findContours(thr, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    k = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
+    thr = cv2.morphologyEx(thr, cv2.MORPH_CLOSE, k, iterations=1)
+    thr = cv2.morphologyEx(thr, cv2.MORPH_OPEN, k, iterations=1)
+    contours, _ = cv2.findContours(thr, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    # 2) Canny fallback
-    edges = cv2.Canny(blur, 60, 150)
-    k3 = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, k3, iterations=1)
-    c2, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    contours = c1 + c2
-
-    quads_raw: List[np.ndarray] = []
+    quads = []
     for c in contours:
         area = cv2.contourArea(c)
-        # reject tiny and very big regions (avoid whole-scene crop)
-        if area < 0.015 * img_area or area > 0.45 * img_area:
+        if area < 0.01 * img_area or area > 0.7 * img_area:
             continue
 
-        peri = cv2.arcLength(c, True)
-        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-        quad = approx if len(approx) == 4 else cv2.boxPoints(cv2.minAreaRect(c)).astype("int").reshape(-1, 1, 2)
-
-        x, y, ww, hh = _bbox(quad)
-        if ww <= 0 or hh <= 0:
-            continue
-
-        # 3) "card-like" filters
+        x, y, ww, hh = cv2.boundingRect(c)
         aspect = max(ww / hh, hh / ww)
-        if not (1.3 <= aspect <= 2.1):   # ID cards ~ 1.4–1.7; allow a bit wider range
+        if not (1.2 <= aspect <= 2.3):
             continue
 
-        rectangularity = area / float(ww * hh)  # 1.0 is a perfect rectangle
-        if rectangularity < 0.65:
+        rectangularity = area / float(ww * hh)
+        if rectangularity < 0.55:
             continue
 
-        quads_raw.append((quad, (x, y, ww, hh), area))
+        quad = cv2.boxPoints(cv2.minAreaRect(c)).astype("int").reshape(-1, 1, 2)
+        quads.append((quad, area))
 
-    # sort tightest/most confident first (smaller bbox & higher rectangularity)
-    quads_raw.sort(key=lambda t: (t[2], - (t[2] / (t[1][2] * t[1][3]))))  # ascending by area, prefer tighter
-
-    # 4) Non-maximum suppression by IoU: drop large boxes that cover smaller ones
-    selected: List[np.ndarray] = []
-    bboxes: List[Tuple[int, int, int, int]] = []
-    for quad, box, _ in quads_raw:
-        keep = True
-        for sb, _ in zip(bboxes, selected):
-            if _iou(box, sb) > 0.6:
-                keep = False
-                break
-        if keep:
+    # Sort largest first, drop overlapping
+    quads.sort(key=lambda x: x[1], reverse=True)
+    selected = []
+    bboxes = []
+    for quad, area in quads:
+        x, y, ww, hh = cv2.boundingRect(quad)
+        box = (x, y, ww, hh)
+        overlap = any(
+            (max(0, min(x + ww, bx + bw) - max(x, bx)) *
+             max(0, min(y + hh, by + bh) - max(y, by))) /
+            float(ww * hh + bw * bh - 1e-6) > 0.5
+            for bx, by, bw, bh in bboxes
+        )
+        if not overlap:
             selected.append(quad)
             bboxes.append(box)
 
-    # If we still detected more than 4, keep the top 4 by area (descending)
-    selected.sort(key=lambda q: cv2.contourArea(q), reverse=True)
-    return selected[:4]
+    selected = selected[:4]  # cap at 4
+    return selected
+
 
 def process_image_to_crops(bgr: np.ndarray) -> List[Tuple[str, bytes]]:
     quads = _find_candidate_quads(bgr)
@@ -266,4 +251,5 @@ async def process(
     import base64
     payload = [{"name": n, "b64": base64.b64encode(d).decode("utf-8")} for n, d in files]
     return {"documents_found": len(files), "files": payload}
+
 
